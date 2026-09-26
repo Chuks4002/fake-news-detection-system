@@ -1,15 +1,24 @@
 
 import streamlit as st
-import joblib, re, os, requests
+import joblib
+import re
+import math
 from pathlib import Path
-from urllib.parse import quote_plus
-from bs4 import BeautifulSoup
+from datetime import datetime, timezone
+from difflib import SequenceMatcher
+
+import requests
 
 BASE = Path(__file__).resolve().parent
 ARTICLE_MODEL = BASE / "fake_news_model.joblib"
 HEADLINE_MODEL = BASE / "headline_model.joblib"
+FACTCHECK_URL = "https://factchecktools.googleapis.com/v1alpha1/claims:search"
 
-st.set_page_config(page_title="Nigerian Fake News Detection System", page_icon="📰")
+st.set_page_config(
+    page_title="Nigerian Fake News Detection System",
+    page_icon="📰",
+    layout="centered",
+)
 
 @st.cache_resource
 def load_models():
@@ -24,153 +33,266 @@ def clean(s):
     return re.sub(r"\s+", " ", s).strip()
 
 def model_prediction(bundle, text):
-    vec, clf = bundle["vectorizer"], bundle["classifier"]
-    X = vec.transform([clean(text)])
-    pred = int(clf.predict(X)[0])
-    probs = clf.predict_proba(X)[0]
-    p = {int(c): float(v) for c, v in zip(clf.classes_, probs)}
-    return pred, p.get(0, 0.0), p.get(1, 0.0)
+    vec = bundle["vectorizer"]
+    clf = bundle["classifier"]
+    x = vec.transform([clean(text)])
+    pred = int(clf.predict(x)[0])
 
-def google_fact_checks(claim):
-    key = st.secrets.get("GOOGLE_FACTCHECK_API_KEY", os.getenv("GOOGLE_FACTCHECK_API_KEY", ""))
-    if not key:
-        return [], "no_api_key"
-    url = "https://factchecktools.googleapis.com/v1alpha1/claims:search"
-    params = {"key": key, "query": claim, "languageCode": "en", "pageSize": 10}
-    try:
-        r = requests.get(url, params=params, timeout=12)
-        r.raise_for_status()
-        return r.json().get("claims", []), "ok"
-    except Exception as e:
-        return [], f"error:{e}"
+    if hasattr(clf, "predict_proba"):
+        probs = clf.predict_proba(x)[0]
+        classes = list(getattr(clf, "classes_", range(len(probs))))
+        prob_map = {int(c): float(p) for c, p in zip(classes, probs)}
+        confidence = max(prob_map.values())
+    else:
+        score = float(clf.decision_function(x)[0])
+        confidence = 1.0 / (1.0 + math.exp(-abs(score)))
+        prob_map = {pred: confidence}
 
-def web_evidence_search(claim):
-    """Discovery-only fallback. It does not invent a truth verdict."""
-    q = quote_plus(claim + " fact check")
-    url = f"https://html.duckduckgo.com/html/?q={q}"
-    try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        results = []
-        for item in soup.select(".result")[:5]:
-            a = item.select_one(".result__a")
-            sn = item.select_one(".result__snippet")
-            if a:
-                results.append({
-                    "title": a.get_text(" ", strip=True),
-                    "url": a.get("href", ""),
-                    "snippet": sn.get_text(" ", strip=True) if sn else ""
-                })
-        return results
-    except Exception:
-        return []
+    label = "Potentially Fake / Misleading" if pred == 0 else "Potentially Real"
+    return label, confidence, prob_map
 
-def normalise_rating(rating):
-    r = rating.lower()
-    if any(x in r for x in ["false", "fake", "incorrect", "wrong", "misleading", "pants on fire"]):
-        return "Potentially Fake / Misleading"
-    if any(x in r for x in ["true", "correct", "accurate"]):
-        return "Potentially Real"
-    if any(x in r for x in ["unproven", "unverified", "unclear", "unsupported"]):
-        return "Unverified"
-    return "Unverified"
+def words(s):
+    return set(re.findall(r"[a-z0-9]+", str(s).lower()))
 
-def render_fact_checks(claims):
-    if not claims:
+def similarity(a, b):
+    """Conservative lexical similarity for matching a returned fact-check
+    to the user's actual claim."""
+    aa, bb = clean(a), clean(b)
+    if not aa or not bb:
+        return 0.0
+    seq = SequenceMatcher(None, aa, bb).ratio()
+    wa, wb = words(aa), words(bb)
+    if not wa or not wb:
+        return seq
+    overlap = len(wa & wb) / max(1, min(len(wa), len(wb)))
+    jaccard = len(wa & wb) / max(1, len(wa | wb))
+    return 0.45 * seq + 0.35 * overlap + 0.20 * jaccard
+
+def extract_date(obj):
+    # The API can expose review metadata in different nested locations.
+    candidates = [
+        obj.get("reviewDate"),
+        obj.get("datePublished"),
+        obj.get("claimReview", {}).get("datePublished")
+            if isinstance(obj.get("claimReview"), dict) else None,
+    ]
+    for value in candidates:
+        if value:
+            try:
+                text = str(value).replace("Z", "+00:00")
+                dt = datetime.fromisoformat(text)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            except Exception:
+                pass
+    return None
+
+def time_sensitive_claim(text):
+    t = text.lower()
+    patterns = [
+        r"\bcurrent\b", r"\bcurrently\b", r"\btoday\b", r"\bnow\b",
+        r"\bthis week\b", r"\bthis month\b", r"\byesterday\b",
+        r"\btomorrow\b", r"\bthis year\b", r"\blatest\b",
+        r"\bpresent president\b",
+    ]
+    return any(re.search(p, t) for p in patterns)
+
+def year_tokens(text):
+    return set(re.findall(r"\b(?:19|20)\d{2}\b", text))
+
+def candidate_relevance(user_claim, result):
+    claim_text = result.get("claim_text", "")
+    title = result.get("title", "")
+    combined = f"{claim_text} {title}".strip()
+    score = similarity(user_claim, combined)
+
+    # If the user's claim names a specific year, a result about a different
+    # year should not be treated as direct evidence.
+    qyears = year_tokens(user_claim)
+    ryears = year_tokens(combined)
+    if qyears and ryears and not (qyears & ryears):
+        return 0.0, "different year/context"
+
+    # Present-time claims require a reasonably recent fact-check. Otherwise an
+    # old fact-check can be incorrectly applied to a changed situation.
+    if time_sensitive_claim(user_claim):
+        dt = result.get("date")
+        if dt is not None:
+            age_days = (datetime.now(timezone.utc) - dt).days
+            if age_days > 365:
+                return score, "stale for a time-sensitive claim"
+
+    return score, "matched"
+
+def search_fact_checks(query, api_key):
+    params = {
+        "query": query[:500],
+        "languageCode": "en",
+        "pageSize": 10,
+        "key": api_key,
+    }
+    response = requests.get(FACTCHECK_URL, params=params, timeout=12)
+    response.raise_for_status()
+    data = response.json()
+
+    results = []
+    for claim in data.get("claims", []):
+        claim_text = claim.get("text", "")
+        for review in claim.get("claimReview", []) or []:
+            publisher = review.get("publisher", {}) or {}
+            rating = review.get("textualRating") or review.get("rating", {}).get("textualRating")
+            url = review.get("url") or review.get("reviewUrl")
+            title = review.get("title") or review.get("claimReviewed") or claim_text
+
+            item = {
+                "claim_text": claim_text,
+                "title": title,
+                "publisher": publisher.get("name") or publisher.get("site") or "Unknown publisher",
+                "rating": rating or "Not stated",
+                "url": url,
+                "date": extract_date(review),
+            }
+            score, reason = candidate_relevance(query, item)
+            item["score"] = score
+            item["reason"] = reason
+            results.append(item)
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results
+
+def select_evidence(query, results):
+    if not results:
         return None
-    # Show the closest available reviews, preserving publisher attribution.
-    reviews = []
-    for c in claims[:5]:
-        for cr in c.get("claimReview", []):
-            reviews.append({
-                "claim": c.get("text", ""),
-                "publisher": cr.get("publisher", {}).get("name", "Unknown publisher"),
-                "rating": cr.get("textualRating", "Unspecified"),
-                "url": cr.get("url", "")
-            })
-    return reviews
 
-article_bundle, headline_bundle = load_models()
+    # Conservative threshold: a related fact-check is not enough.
+    best = results[0]
+    if best["score"] < 0.62:
+        return None
 
-st.title("Fake News Detection & Claim Verification System")
-st.write("NLP classification combined with evidence-based claim verification.")
+    if best["reason"] == "stale for a time-sensitive claim":
+        return None
+
+    # For short claims, require stronger lexical agreement.
+    q_words = words(query)
+    if len(q_words) <= 7 and best["score"] < 0.72:
+        return None
+
+    return best
+
+# ---------------- UI ----------------
+
+try:
+    article_bundle, headline_bundle = load_models()
+except Exception as exc:
+    st.error("The machine-learning model could not be loaded.")
+    st.exception(exc)
+    st.stop()
+
+st.title("Fake News Detection System")
+st.write(
+    "Natural Language Processing prototype for classifying news text and "
+    "checking it against published fact-check evidence."
+)
 
 st.info(
-    "The NLP model detects patterns learned from labelled news data. "
-    "The verification layer checks whether the claim has published fact-check evidence. "
-    "A claim is never called true merely because the NLP classifier predicts REAL."
+    "The NLP model estimates linguistic classification risk. "
+    "The verification result is based on matching published fact-check evidence; "
+    "a missing fact-check does not mean a claim is true."
 )
 
-demo = st.selectbox(
-    "Demo examples",
-    [
-        "Choose a demo…",
-        "The sky is red",
-        "Nigeria has 36 states",
-    ],
+mode = st.radio(
+    "Input type",
+    ["Headline / claim", "Full article"],
+    horizontal=True,
 )
-if demo != "Choose a demo…":
-    st.session_state["claim_text"] = demo
 
-mode = st.radio("Input type", ["Headline / claim", "Full article"], horizontal=True)
-claim = st.text_area(
+text = st.text_area(
     "Enter a claim or news text",
-    value=st.session_state.get("claim_text", ""),
-    height=220 if mode == "Full article" else 130,
+    height=220,
+    placeholder="Example: The government has announced a new national holiday.",
 )
 
 if st.button("Analyse & Verify", type="primary"):
-    text = claim.strip()
-    if not text:
+    if not text.strip():
         st.warning("Please enter text to analyse.")
         st.stop()
 
+    min_words = 3 if mode == "Headline / claim" else 20
+    if len(text.split()) < min_words:
+        st.warning(
+            f"Please enter at least {min_words} words for {mode.lower()} analysis."
+        )
+        st.stop()
+
+    # NLP layer
     bundle = headline_bundle if mode == "Headline / claim" else article_bundle
-    if mode == "Headline / claim" and len(clean(text).split()) < 3:
-        st.warning("Please enter a complete claim or headline.")
-        st.stop()
-    if mode == "Full article" and len(clean(text).split()) < 20:
-        st.warning("For article mode, paste a fuller article.")
-        st.stop()
+    nlp_label, nlp_confidence, _ = model_prediction(bundle, text)
 
-    pred, fake_p, real_p = model_prediction(bundle, text)
+    # Fact-check layer
+    api_key = st.secrets.get("GOOGLE_FACTCHECK_API_KEY", "").strip()
 
-    with st.spinner("Checking available fact-check evidence…"):
-        claims, status = google_fact_checks(text)
-        reviews = render_fact_checks(claims)
-        discovery = [] if reviews else web_evidence_search(text)
+    evidence = None
+    raw_results = []
+    api_error = None
+
+    if api_key:
+        try:
+            raw_results = search_fact_checks(text, api_key)
+            evidence = select_evidence(text, raw_results)
+        except requests.HTTPError as exc:
+            api_error = f"Fact-check API returned HTTP {exc.response.status_code}."
+        except requests.RequestException:
+            api_error = "The fact-check service could not be reached."
+        except Exception as exc:
+            api_error = f"Fact-check lookup failed: {exc}"
 
     st.subheader("Verification result")
 
-    if reviews:
-        # Use attributed fact-check publisher ratings as the evidence verdict.
-        primary = reviews[0]
-        verdict = normalise_rating(primary["rating"])
-        if verdict == "Potentially Fake / Misleading":
-            st.error(f"VERDICT: {verdict}")
-        elif verdict == "Potentially Real":
-            st.success(f"VERDICT: {verdict}")
-        else:
-            st.warning(f"VERDICT: {verdict}")
+    if evidence:
+        rating = evidence["rating"]
+        rating_lower = rating.lower()
 
-        st.write(
-            f"**Fact-check publisher:** {primary['publisher']}  \n"
-            f"**Published rating:** {primary['rating']}"
-        )
-        if primary["url"]:
-            st.link_button("Open fact-check", primary["url"])
+        if any(x in rating_lower for x in ["false", "fake", "incorrect", "misleading"]):
+            st.error("VERDICT: Potentially Fake / Misleading")
+        elif any(x in rating_lower for x in ["true", "correct", "accurate"]):
+            st.success("VERDICT: Supported by Published Fact-check Evidence")
+        else:
+            st.warning("VERDICT: Published Fact-check Found — Review Rating")
+
+        st.write(f"**Fact-check publisher:** {evidence['publisher']}")
+        st.write(f"**Published rating:** {rating}")
+        st.write(f"**Matched claim:** {evidence['claim_text']}")
+
+        if evidence["date"]:
+            st.write(
+                f"**Fact-check date:** {evidence['date'].date().isoformat()}"
+            )
+
+        if evidence["url"]:
+            st.link_button("Open fact-check", evidence["url"])
 
         st.caption(
             "The verdict above is attributed to the fact-check publisher. "
-            "It is not generated by the NLP classifier."
+            "It is not generated by the NLP classifier. The system first checks "
+            "whether the returned fact-check is sufficiently similar and "
+            "contextually relevant to the submitted claim."
         )
+
     else:
         st.warning("VERDICT: UNVERIFIED")
-        if status == "no_api_key":
+        if api_error:
+            st.write(api_error)
+        elif not api_key:
             st.write(
-                "No Google Fact Check Tools API key is configured, so the app "
-                "cannot query the indexed fact-check database yet."
+                "No Google Fact Check API key is configured. The system cannot "
+                "issue an evidence-based fact-check verdict."
+            )
+        elif raw_results:
+            st.write(
+                "Related fact-check records were found, but none passed the "
+                "system's claim-similarity/context checks. They were not used "
+                "to issue a false/true verdict."
             )
         else:
             st.write(
@@ -179,37 +301,30 @@ if st.button("Analyse & Verify", type="primary"):
                 "verified evidence to issue a fake/real verdict."
             )
 
-        if discovery:
-            st.markdown("**Evidence candidates found on the web:**")
-            for item in discovery:
-                st.markdown(f"**{item['title']}**")
-                if item["snippet"]:
-                    st.caption(item["snippet"])
-                if item["url"]:
-                    st.link_button("Open source", item["url"])
-        else:
-            st.caption("No evidence candidates were retrieved.")
-
     st.subheader("NLP model assessment")
-    label = "Potentially Fake / Misleading" if pred == 0 else "Potentially Real"
-    st.write(f"**NLP classification:** {label}")
-    st.write(f"Fake probability: **{fake_p:.1%}**")
-    st.write(f"Real probability: **{real_p:.1%}**")
+    if nlp_label == "Potentially Fake / Misleading":
+        st.error(f"{nlp_label} — model confidence: {nlp_confidence:.1%}")
+    else:
+        st.success(f"{nlp_label} — model confidence: {nlp_confidence:.1%}")
 
     st.caption(
-        "Important: NLP classification and factual verification are separate. "
-        "The classifier does not establish truth. When verified evidence is unavailable, "
-        "the system returns UNVERIFIED rather than treating a REAL prediction as proof."
+        "The NLP assessment is a statistical text-classification output trained "
+        "on the project's labelled dataset. It is not independent fact-checking."
     )
 
-with st.expander("System architecture"):
-    st.markdown(
-        "1. Text preprocessing → 2. NLP classification → 3. Claim verification → "
-        "4. Evidence retrieval → 5. Attributed verdict / UNVERIFIED."
-    )
+    if raw_results and evidence is None:
+        with st.expander("Why a related fact-check was not used"):
+            for r in raw_results[:5]:
+                date_text = r["date"].date().isoformat() if r["date"] else "date unavailable"
+                st.write(
+                    f"**{r['publisher']}** — {r['rating']} — similarity "
+                    f"{r['score']:.2f} — {r['reason']} — {date_text}"
+                )
+                st.write(r["claim_text"])
 
-with st.expander("Deployment note"):
+with st.expander("About the system"):
     st.write(
-        "For live Google Fact Check verification, add a Streamlit secret named "
-        "`GOOGLE_FACTCHECK_API_KEY`. The Google Fact Check Tools API requires an API key."
+        "The system combines an NLP classification layer with a conservative "
+        "published-fact-check retrieval layer. It does not treat the absence "
+        "of a fact-check as proof that a claim is true."
     )
