@@ -1,0 +1,21 @@
+test_id,actual,predicted,pass,text_preview
+TC-01,REAL,REAL,True,"EPIC: New Yorker’s “Hillary Themed” Haunted House Has Libs Absolutely Furious Before viewing the video, below, please be warned that its contents are truly disturbing. If you have "
+TC-02,REAL,REAL,True,DOZENS Of GOP Foreign Policy Experts Pledge To Stop Trump From Winning Nomination Over sixty GOP national security buffs have taken a pledge to work  energetically  and do whatever
+TC-03,REAL,REAL,True,WATCH HILARIOUS SNL “Draw Muhammed” Contest Skit… We d like to offer a special word of  thanks  to Pamela Gellar for shining the light on the truth about Americans who are being bu
+TC-04,FAKE,FAKE,True,A Rising Black Leader Who Pulled Off His Own Fake Obituary - The New York Times It is impossible to know what Grady O’Cummings III might have represented to the group of youngsters
+TC-05,FAKE,FAKE,True,"G.O.P. Plans Immediate Repeal of Health Law, Then a Delay - The New York Times WASHINGTON  —   Republicans in Congress plan to move almost immediately next month to repeal the Affo"
+TC-06,FAKE,FAKE,True,"Delay seen, again, on Trump growth agenda after Comey sacking NEW YORK (Reuters) - Not even a week after the Trump administration and Congress rekindled optimism that they could so"
+TC-07,REAL,REAL,True,"GOP Governor’s Sr. Aide Admits Running Government Like A Business Is A Disaster In light of the Flint water crisis, Michigan Republicans are publicly and privately acknowledging th"
+TC-08,REAL,REAL,True,Here Are Just A Few Things America Could Afford If The Wealthy Actually PAID Their Fair Share It isn t much of a secret these days that rich people do not pay their fair share of t
+TC-09,FAKE,REAL,False,"How Yemen Fits Iran Plans for Mideast Rule, Beyond WASHINGTON  The remaining Americans have been evacuated from the country of Yemen. The United States closed its embassy because "
+TC-10,FAKE,FAKE,True,"MP in Hariri's party: Hariri says Saudi not holding him, his family BEIRUT (Reuters) - A member of the political party of Saad al-Hariri, who resigned from his post as Lebanon s pr"
+TC-11,FAKE,FAKE,True,California College Professor Who Called Trump’s Win an ’Act of Terrorism’ Nominated for Campus Award - Breitbart A California college professor who called President Trump’s electio
+TC-12,REAL,REAL,True,"Dilbert Creator Explains “How Do I Know The Emails Are That Bad?”  If you’re following the news, you know FBI Director James Comey announced that the FBI found a bunch of emails on"
+TC-13,REAL,REAL,True,"Republican Cop GOES OFF On The GOP, Slams Them For Being ‘Hypocrites’ And ‘Idiots’ (VIDEO) Anyone following the current election has every right to be absolutely disgusted with the"
+TC-14,FAKE,FAKE,True,Pence trip to Middle East overshadowed by Trump's Jerusalem decision WASHINGTON (Reuters) - U.S. Vice President Mike Pence will underscore the U.S. partnership with Israel during a
+TC-15,FAKE,FAKE,True,"GOP braces for Trump loss, roiled by refusal to accept election results A wave of apprehension and anguish swept the Republican Party on Thursday, with many GOP leaders alarmed by "
+TC-16,FAKE,FAKE,True,"Why I'm more worried about Marco Rubio than Donald Trump Update: On March 13, 2016 I realized I was wrong about this.  When not delighting in the epic meltdown of establishment Rep"
+TC-17,REAL,REAL,True,BUSTED: South Carolina Trump Adviser Gets Slapped With 30 Counts Of Ethics Violations We can probably expect more Donald Trump lackies to be hit with ethics violations over the nex
+TC-18,REAL,REAL,True,Trump Already Going Ballistic Over Maddow Getting His Tax Returns – Releases Unhinged Statement Trump has long claimed that he was legally not allowed to release his tax returns be
+TC-19,FAKE,FAKE,True,"Ireland will not threaten to veto Brexit talks 'at this stage', PM says DUBLIN (Reuters) - Ireland will not threaten to use a veto on Brexit talks  at this stage  over the lack of "
+TC-20,REAL,REAL,True,"Consolidate all the muslim countries into one big caliphate, give them one vote at the UN, and then tell them to all shut up. Problem solved."
