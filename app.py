@@ -125,39 +125,106 @@ def candidate_relevance(user_claim, result):
 
     return score, "matched"
 
-def search_fact_checks(query, api_key):
-    params = {
-        "query": query[:500],
-        "languageCode": "en",
-        "pageSize": 10,
-        "key": api_key,
+def build_factcheck_queries(query):
+    """Create several conservative search variants for the Google Fact Check API.
+
+    The API search is keyword-oriented, so a single natural-language query can
+    miss a published fact-check even when the fact-check claim is an excellent
+    match. These variants improve retrieval without weakening the evidence
+    matching performed after retrieval.
+    """
+    original = re.sub(r"\s+", " ", str(query)).strip()
+    cleaned = clean(original)
+
+    # Keep informative words while dropping common grammatical words. This is
+    # only for retrieval; the original claim is still used for verification.
+    stopwords = {
+        "a", "an", "and", "are", "as", "at", "be", "been", "being", "but",
+        "by", "for", "from", "has", "have", "had", "he", "her", "his", "i",
+        "if", "in", "into", "is", "it", "its", "of", "on", "or", "that",
+        "the", "their", "there", "these", "they", "this", "to", "was", "were",
+        "will", "with", "would", "you", "your"
     }
-    response = requests.get(FACTCHECK_URL, params=params, timeout=12)
-    response.raise_for_status()
-    data = response.json()
+    informative = [w for w in cleaned.split() if w not in stopwords]
 
-    results = []
-    for claim in data.get("claims", []):
-        claim_text = claim.get("text", "")
-        for review in claim.get("claimReview", []) or []:
-            publisher = review.get("publisher", {}) or {}
-            rating = review.get("textualRating") or review.get("rating", {}).get("textualRating")
-            url = review.get("url") or review.get("reviewUrl")
-            title = review.get("title") or review.get("claimReviewed") or claim_text
+    queries = [original]
 
-            item = {
-                "claim_text": claim_text,
-                "title": title,
-                "publisher": publisher.get("name") or publisher.get("site") or "Unknown publisher",
-                "rating": rating or "Not stated",
-                "url": url,
-                "date": extract_date(review),
-            }
-            score, reason = candidate_relevance(query, item)
-            item["score"] = score
-            item["reason"] = reason
-            results.append(item)
+    # A compact keyword query is often more discoverable than a sentence.
+    if len(informative) >= 2:
+        queries.append(" ".join(informative[:12]))
 
+    # A slightly shorter variant helps when the API ranks exact keyword
+    # combinations more strongly than long natural-language sentences.
+    if len(informative) > 5:
+        queries.append(" ".join(informative[:8]))
+
+    # Remove duplicates while preserving deterministic order.
+    unique = []
+    seen = set()
+    for q in queries:
+        q = q.strip()
+        key = q.lower()
+        if q and key not in seen:
+            seen.add(key)
+            unique.append(q[:500])
+    return unique
+
+
+def search_fact_checks(query, api_key):
+    """Retrieve fact-check candidates using several query variants.
+
+    Retrieval is intentionally broad, but a result is never accepted merely
+    because it was returned by the API. candidate_relevance/select_evidence
+    still decide whether it is sufficiently similar and contextually valid.
+    """
+    all_results = []
+
+    for search_query in build_factcheck_queries(query):
+        params = {
+            "query": search_query,
+            "languageCode": "en",
+            "pageSize": 10,
+            "key": api_key,
+        }
+        response = requests.get(FACTCHECK_URL, params=params, timeout=12)
+        response.raise_for_status()
+        data = response.json()
+
+        for claim in data.get("claims", []):
+            claim_text = claim.get("text", "")
+            for review in claim.get("claimReview", []) or []:
+                publisher = review.get("publisher", {}) or {}
+                rating = review.get("textualRating") or review.get("rating", {}).get("textualRating")
+                url = review.get("url") or review.get("reviewUrl")
+                title = review.get("title") or review.get("claimReviewed") or claim_text
+
+                item = {
+                    "claim_text": claim_text,
+                    "title": title,
+                    "publisher": publisher.get("name") or publisher.get("site") or "Unknown publisher",
+                    "rating": rating or "Not stated",
+                    "url": url,
+                    "date": extract_date(review),
+                    "search_query": search_query,
+                }
+                score, reason = candidate_relevance(query, item)
+                item["score"] = score
+                item["reason"] = reason
+                all_results.append(item)
+
+    # The same review can be returned for multiple query variants. Keep the
+    # strongest-scoring copy so the UI remains clean and deterministic.
+    deduped = {}
+    for item in all_results:
+        key = item.get("url") or (
+            item.get("publisher", ""),
+            item.get("claim_text", ""),
+            item.get("rating", "")
+        )
+        if key not in deduped or item["score"] > deduped[key]["score"]:
+            deduped[key] = item
+
+    results = list(deduped.values())
     results.sort(key=lambda x: x["score"], reverse=True)
     return results
 
