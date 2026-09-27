@@ -126,18 +126,15 @@ def candidate_relevance(user_claim, result):
     return score, "matched"
 
 def build_factcheck_queries(query):
-    """Create several conservative search variants for the Google Fact Check API.
+    """Create several retrieval variants for the Google Fact Check API.
 
-    The API search is keyword-oriented, so a single natural-language query can
-    miss a published fact-check even when the fact-check claim is an excellent
-    match. These variants improve retrieval without weakening the evidence
-    matching performed after retrieval.
+    Google documents `query` as a textual search over fact-checked claims.
+    Different wording can therefore retrieve different records. The original
+    claim remains the only text used by the evidence-matching stage.
     """
     original = re.sub(r"\s+", " ", str(query)).strip()
     cleaned = clean(original)
 
-    # Keep informative words while dropping common grammatical words. This is
-    # only for retrieval; the original claim is still used for verification.
     stopwords = {
         "a", "an", "and", "are", "as", "at", "be", "been", "being", "but",
         "by", "for", "from", "has", "have", "had", "he", "her", "his", "i",
@@ -148,17 +145,14 @@ def build_factcheck_queries(query):
     informative = [w for w in cleaned.split() if w not in stopwords]
 
     queries = [original]
+    if informative:
+        queries.append(" ".join(informative))
+    if len(informative) >= 3:
+        # Entity/topic-first variants often work better for fact-check titles.
+        queries.append(" ".join([informative[0], informative[-1], *informative[1:-1]]))
+        queries.append(" ".join(informative[:2] + informative[-2:]))
 
-    # A compact keyword query is often more discoverable than a sentence.
-    if len(informative) >= 2:
-        queries.append(" ".join(informative[:12]))
-
-    # A slightly shorter variant helps when the API ranks exact keyword
-    # combinations more strongly than long natural-language sentences.
-    if len(informative) > 5:
-        queries.append(" ".join(informative[:8]))
-
-    # Remove duplicates while preserving deterministic order.
+    # Remove duplicates while preserving order.
     unique = []
     seen = set()
     for q in queries:
@@ -170,50 +164,73 @@ def build_factcheck_queries(query):
     return unique
 
 
-def search_fact_checks(query, api_key):
-    """Retrieve fact-check candidates using several query variants.
+def nigeria_related(query):
+    t = clean(query)
+    return bool(re.search(r"\b(?:nigeria|nigerian|abuja|lagos|tinubu|naira)\b", t))
 
-    Retrieval is intentionally broad, but a result is never accepted merely
-    because it was returned by the API. candidate_relevance/select_evidence
-    still decide whether it is sufficiently similar and contextually valid.
+
+def search_fact_checks(query, api_key):
+    """Retrieve fact-check candidates with broad search plus a Nigerian-source fallback.
+
+    The primary source remains Google's Fact Check Tools API. For Nigerian claims,
+    a second pass uses Google's publisher-site filter for established Nigerian/
+    Africa-focused fact-check publishers. This improves regional recall without
+    bypassing the evidence-similarity checks below.
     """
     all_results = []
 
+    def run_search(search_query, publisher_filter=None, offsets=(0, 20)):
+        # Two result windows reduce the chance that a relevant record is buried
+        # behind the first page of search results.
+        for offset in offsets:
+            params = {
+                "query": search_query,
+                "languageCode": "en",
+                "pageSize": 20,
+                "offset": offset,
+                "key": api_key,
+            }
+            if publisher_filter:
+                params["reviewPublisherSiteFilter"] = publisher_filter
+
+            response = requests.get(FACTCHECK_URL, params=params, timeout=12)
+            response.raise_for_status()
+            data = response.json()
+
+            for claim in data.get("claims", []):
+                claim_text = claim.get("text", "")
+                for review in claim.get("claimReview", []) or []:
+                    publisher = review.get("publisher", {}) or {}
+                    rating = review.get("textualRating") or review.get("rating", {}).get("textualRating")
+                    url = review.get("url") or review.get("reviewUrl")
+                    title = review.get("title") or review.get("claimReviewed") or claim_text
+
+                    item = {
+                        "claim_text": claim_text,
+                        "title": title,
+                        "publisher": publisher.get("name") or publisher.get("site") or "Unknown publisher",
+                        "rating": rating or "Not stated",
+                        "url": url,
+                        "date": extract_date(review),
+                        "search_query": search_query,
+                        "publisher_filter": publisher_filter,
+                    }
+                    score, reason = candidate_relevance(query, item)
+                    item["score"] = score
+                    item["reason"] = reason
+                    all_results.append(item)
+
     for search_query in build_factcheck_queries(query):
-        params = {
-            "query": search_query,
-            "languageCode": "en",
-            "pageSize": 10,
-            "key": api_key,
-        }
-        response = requests.get(FACTCHECK_URL, params=params, timeout=12)
-        response.raise_for_status()
-        data = response.json()
+        run_search(search_query)
 
-        for claim in data.get("claims", []):
-            claim_text = claim.get("text", "")
-            for review in claim.get("claimReview", []) or []:
-                publisher = review.get("publisher", {}) or {}
-                rating = review.get("textualRating") or review.get("rating", {}).get("textualRating")
-                url = review.get("url") or review.get("reviewUrl")
-                title = review.get("title") or review.get("claimReviewed") or claim_text
+    # If this is a Nigerian claim, explicitly search major regional fact-check
+    # publishers as a recall fallback. This does not accept their result blindly.
+    if nigeria_related(query):
+        for publisher in ("africacheck.org", "dubawa.org"):
+            for search_query in build_factcheck_queries(query)[:2]:
+                run_search(search_query, publisher, offsets=(0,))
 
-                item = {
-                    "claim_text": claim_text,
-                    "title": title,
-                    "publisher": publisher.get("name") or publisher.get("site") or "Unknown publisher",
-                    "rating": rating or "Not stated",
-                    "url": url,
-                    "date": extract_date(review),
-                    "search_query": search_query,
-                }
-                score, reason = candidate_relevance(query, item)
-                item["score"] = score
-                item["reason"] = reason
-                all_results.append(item)
-
-    # The same review can be returned for multiple query variants. Keep the
-    # strongest-scoring copy so the UI remains clean and deterministic.
+    # Deduplicate repeated records returned by multiple query variants/pages.
     deduped = {}
     for item in all_results:
         key = item.get("url") or (
