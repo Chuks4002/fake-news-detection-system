@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 
 import requests
+from bs4 import BeautifulSoup
+from urllib.parse import quote_plus
 
 BASE = Path(__file__).resolve().parent
 ARTICLE_MODEL = BASE / "fake_news_model.joblib"
@@ -169,68 +171,285 @@ def nigeria_related(query):
     return bool(re.search(r"\b(?:nigeria|nigerian|abuja|lagos|tinubu|naira)\b", t))
 
 
-def search_fact_checks(query, api_key):
-    """Retrieve fact-check candidates with broad search plus a Nigerian-source fallback.
+def _make_item(query, claim_text, title, publisher, rating, url, date,
+                search_query="", publisher_filter=""):
+    item = {
+        "claim_text": claim_text or title or "",
+        "title": title or claim_text or "",
+        "publisher": publisher or "Unknown publisher",
+        "rating": rating or "Not stated",
+        "url": url,
+        "date": date,
+        "search_query": search_query,
+        "publisher_filter": publisher_filter,
+    }
+    score, reason = candidate_relevance(query, item)
+    item["score"] = score
+    item["reason"] = reason
+    return item
 
-    The primary source remains Google's Fact Check Tools API. For Nigerian claims,
-    a second pass uses Google's publisher-site filter for established Nigerian/
-    Africa-focused fact-check publishers. This improves regional recall without
-    bypassing the evidence-similarity checks below.
+
+def _parse_google_claims(query, data, all_results, search_query, publisher_filter=""):
+    for claim in data.get("claims", []) or []:
+        claim_text = claim.get("text", "")
+        for review in claim.get("claimReview", []) or []:
+            publisher = review.get("publisher", {}) or {}
+            item = _make_item(
+                query=query,
+                claim_text=claim_text,
+                title=review.get("title") or claim_text,
+                publisher=publisher.get("name") or publisher.get("site"),
+                rating=review.get("textualRating"),
+                url=review.get("url"),
+                date=extract_date(review),
+                search_query=search_query,
+                publisher_filter=publisher_filter,
+            )
+            all_results.append(item)
+
+
+def _search_google_once(query, api_key, publisher_filter=None, offset=0):
+    """One documented Fact Check Tools API request."""
+    params = {
+        "query": query,
+        "languageCode": "en",
+        "pageSize": 50,
+        "offset": offset,
+        "key": api_key,
+    }
+    if publisher_filter:
+        params["reviewPublisherSiteFilter"] = publisher_filter
+
+    response = requests.get(FACTCHECK_URL, params=params, timeout=15)
+    response.raise_for_status()
+    return response.json()
+
+
+def _africacheck_candidates(query):
+    """Regional fallback for Nigerian claims.
+
+    Africa Check has a public search page. This fallback is deliberately
+    separate from the Google API result set and still passes every candidate
+    through the same claim/context matching stage.
+    """
+    if not nigeria_related(query):
+        return []
+
+    results = []
+    search_url = (
+        "https://africacheck.org/search?search_api_fulltext="
+        + quote_plus(query)
+    )
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1"
+        )
+    }
+
+    try:
+        response = requests.get(search_url, headers=headers, timeout=15)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        seen_urls = set()
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "")
+            if "/fact-checks/" not in href:
+                continue
+
+            if href.startswith("/"):
+                url = "https://africacheck.org" + href
+            elif href.startswith("http"):
+                url = href
+            else:
+                continue
+
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            title = " ".join(a.get_text(" ", strip=True).split())
+            if len(title) < 10:
+                continue
+
+            # The search result title itself is used as the candidate claim
+            # representation. Do not invent a rating from unrelated text.
+            item = _make_item(
+                query=query,
+                claim_text=title,
+                title=title,
+                publisher="Africa Check",
+                rating="Not stated",
+                url=url,
+                date=None,
+                search_query=query,
+                publisher_filter="africacheck.org",
+            )
+
+            # Only fetch an article after it has reasonable lexical relevance.
+            if item["score"] < 0.40:
+                continue
+
+            try:
+                article = requests.get(url, headers=headers, timeout=12)
+                if article.ok:
+                    article_soup = BeautifulSoup(article.text, "html.parser")
+
+                    # Prefer ClaimReview JSON-LD when available.
+                    for script in article_soup.find_all(
+                        "script", attrs={"type": "application/ld+json"}
+                    ):
+                        raw = script.string or script.get_text()
+                        try:
+                            data = json.loads(raw)
+                        except Exception:
+                            continue
+
+                        objects = data if isinstance(data, list) else [data]
+                        stack = list(objects)
+                        while stack:
+                            obj = stack.pop()
+                            if isinstance(obj, dict):
+                                typ = obj.get("@type")
+                                if typ == "ClaimReview" or (
+                                    isinstance(typ, list) and "ClaimReview" in typ
+                                ):
+                                    claim_reviewed = obj.get("claimReviewed") or title
+                                    rating_obj = obj.get("reviewRating") or {}
+                                    rating = (
+                                        rating_obj.get("alternateName")
+                                        or rating_obj.get("textualRating")
+                                        or "Not stated"
+                                    )
+                                    date_value = obj.get("datePublished")
+                                    dt = None
+                                    if date_value:
+                                        try:
+                                            dt = datetime.fromisoformat(
+                                                str(date_value).replace("Z", "+00:00")
+                                            )
+                                            if dt.tzinfo is None:
+                                                dt = dt.replace(tzinfo=timezone.utc)
+                                        except Exception:
+                                            pass
+
+                                    item = _make_item(
+                                        query=query,
+                                        claim_text=claim_reviewed,
+                                        title=title,
+                                        publisher="Africa Check",
+                                        rating=rating,
+                                        url=obj.get("url") or url,
+                                        date=dt,
+                                        search_query=query,
+                                        publisher_filter="africacheck.org",
+                                    )
+                                    break
+
+                                for value in obj.values():
+                                    if isinstance(value, (dict, list)):
+                                        stack.append(value)
+                            elif isinstance(obj, list):
+                                stack.extend(obj)
+
+                    # If structured data did not provide a rating, use only
+                    # explicit wording on the article page.
+                    if item["rating"] == "Not stated":
+                        body_text = article_soup.get_text(" ", strip=True).lower()
+                        if re.search(r"\bthe claim is false\b", body_text):
+                            item["rating"] = "False"
+                        elif re.search(r"\bclaim is misleading\b", body_text):
+                            item["rating"] = "Misleading"
+
+            except requests.RequestException:
+                pass
+
+            results.append(item)
+
+    except requests.RequestException:
+        return []
+
+    # Keep only the strongest candidates.
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:10]
+
+
+def search_fact_checks(query, api_key):
+    """Retrieve fact-check candidates using Google plus a Nigerian regional fallback.
+
+    Google Fact Check Tools supports textual query, publisher filtering, and
+    offset/page-token pagination. We use multiple focused queries to improve
+    recall, then apply the same conservative evidence matching before a verdict.
     """
     all_results = []
 
-    def run_search(search_query, publisher_filter=None, offsets=(0, 20)):
-        # Two result windows reduce the chance that a relevant record is buried
-        # behind the first page of search results.
-        for offset in offsets:
-            params = {
-                "query": search_query,
-                "languageCode": "en",
-                "pageSize": 20,
-                "offset": offset,
-                "key": api_key,
-            }
-            if publisher_filter:
-                params["reviewPublisherSiteFilter"] = publisher_filter
+    queries = build_factcheck_queries(query)
 
-            response = requests.get(FACTCHECK_URL, params=params, timeout=12)
-            response.raise_for_status()
-            data = response.json()
+    # Add a compact entity/topic query. This is especially useful when the
+    # original sentence differs from the wording used by the fact-checker.
+    informative = [
+        w for w in clean(query).split()
+        if w not in {
+            "a", "an", "and", "are", "as", "at", "be", "been", "being", "but",
+            "by", "for", "from", "has", "have", "had", "he", "her", "his", "i",
+            "if", "in", "into", "is", "it", "its", "of", "on", "or", "that",
+            "the", "their", "there", "these", "they", "this", "to", "was",
+            "were", "will", "with", "would", "you", "your"
+        }
+    ]
+    if len(informative) >= 3:
+        queries.append(" ".join(informative))
 
-            for claim in data.get("claims", []):
-                claim_text = claim.get("text", "")
-                for review in claim.get("claimReview", []) or []:
-                    publisher = review.get("publisher", {}) or {}
-                    rating = review.get("textualRating") or review.get("rating", {}).get("textualRating")
-                    url = review.get("url") or review.get("reviewUrl")
-                    title = review.get("title") or review.get("claimReviewed") or claim_text
+    # Deduplicate queries.
+    unique_queries = []
+    seen_q = set()
+    for q in queries:
+        key = q.lower().strip()
+        if key and key not in seen_q:
+            seen_q.add(key)
+            unique_queries.append(q)
 
-                    item = {
-                        "claim_text": claim_text,
-                        "title": title,
-                        "publisher": publisher.get("name") or publisher.get("site") or "Unknown publisher",
-                        "rating": rating or "Not stated",
-                        "url": url,
-                        "date": extract_date(review),
-                        "search_query": search_query,
-                        "publisher_filter": publisher_filter,
-                    }
-                    score, reason = candidate_relevance(query, item)
-                    item["score"] = score
-                    item["reason"] = reason
-                    all_results.append(item)
+    # Google API: first page plus one offset page for each focused query.
+    # The API explicitly documents offset as a supported parameter.
+    for search_query in unique_queries[:5]:
+        for offset in (0, 50):
+            try:
+                data = _search_google_once(
+                    search_query, api_key, publisher_filter=None, offset=offset
+                )
+                _parse_google_claims(
+                    query, data, all_results, search_query, ""
+                )
+                if not data.get("claims"):
+                    break
+            except requests.RequestException:
+                # Preserve successful results from other query variants.
+                break
 
-    for search_query in build_factcheck_queries(query):
-        run_search(search_query)
-
-    # If this is a Nigerian claim, explicitly search major regional fact-check
-    # publishers as a recall fallback. This does not accept their result blindly.
+    # Publisher-filtered searches are useful for Nigeria-specific claims.
     if nigeria_related(query):
         for publisher in ("africacheck.org", "dubawa.org"):
-            for search_query in build_factcheck_queries(query)[:2]:
-                run_search(search_query, publisher, offsets=(0,))
+            for search_query in unique_queries[:3]:
+                try:
+                    data = _search_google_once(
+                        search_query,
+                        api_key,
+                        publisher_filter=publisher,
+                        offset=0,
+                    )
+                    _parse_google_claims(
+                        query, data, all_results, search_query, publisher
+                    )
+                except requests.RequestException:
+                    break
 
-    # Deduplicate repeated records returned by multiple query variants/pages.
+    # Direct Africa Check search fallback. This is still treated as external
+    # published evidence, not as an NLP prediction.
+    all_results.extend(_africacheck_candidates(query))
+
+    # Deduplicate records returned through different retrieval paths.
     deduped = {}
     for item in all_results:
         key = item.get("url") or (
@@ -244,6 +463,7 @@ def search_fact_checks(query, api_key):
     results = list(deduped.values())
     results.sort(key=lambda x: x["score"], reverse=True)
     return results
+
 
 def select_evidence(query, results):
     if not results:
