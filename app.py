@@ -1,9 +1,9 @@
-
 import streamlit as st
 import joblib
 import re
 import math
 import json
+import csv
 from pathlib import Path
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -11,31 +11,16 @@ from difflib import SequenceMatcher
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import quote_plus
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 BASE = Path(__file__).resolve().parent
 ARTICLE_MODEL = BASE / "fake_news_model.joblib"
 HEADLINE_MODEL = BASE / "headline_model.joblib"
+LOCAL_FACTCHECK_CSV = BASE / "nigerian_factchecks.csv"
 FACTCHECK_URL = "https://factchecktools.googleapis.com/v1alpha1/claims:search"
 
-# Verified seed evidence used as a local fallback when a published fact-check
-# source is not returned by the live API/search service. The record below was
-# verified against the publisher's public fact-check page and is not an NLP prediction.
-VERIFIED_FACTCHECK_INDEX = [
-    {
-        "claim_text": "Nigeria has launched a missile into Burkina Faso",
-        "title": "No, Nigeria has not launched a missile into Burkina Faso",
-        "publisher": "Africa Check",
-        "rating": "False",
-        "url": "https://africacheck.org/fact-checks/meta-programme-fact-checks/no-nigeria-has-not-launched-missile-burkina-faso",
-        "date": datetime(2025, 5, 8, tzinfo=timezone.utc),
-    },
-]
-
-st.set_page_config(
-    page_title="Nigerian Fake News Detection System",
-    page_icon="📰",
-    layout="centered",
-)
+st.set_page_config(page_title="Nigerian Fake News Detection System", page_icon="📰", layout="centered")
 
 @st.cache_resource
 def load_models():
@@ -50,11 +35,9 @@ def clean(s):
     return re.sub(r"\s+", " ", s).strip()
 
 def model_prediction(bundle, text):
-    vec = bundle["vectorizer"]
-    clf = bundle["classifier"]
+    vec, clf = bundle["vectorizer"], bundle["classifier"]
     x = vec.transform([clean(text)])
     pred = int(clf.predict(x)[0])
-
     if hasattr(clf, "predict_proba"):
         probs = clf.predict_proba(x)[0]
         classes = list(getattr(clf, "classes_", range(len(probs))))
@@ -64,621 +47,252 @@ def model_prediction(bundle, text):
         score = float(clf.decision_function(x)[0])
         confidence = 1.0 / (1.0 + math.exp(-abs(score)))
         prob_map = {pred: confidence}
-
-    label = "Potentially Fake / Misleading" if pred == 0 else "Potentially Real"
-    return label, confidence, prob_map
+    return ("Potentially Fake / Misleading" if pred == 0 else "Potentially Real", confidence, prob_map)
 
 def words(s):
     return set(re.findall(r"[a-z0-9]+", str(s).lower()))
 
 def similarity(a, b):
-    """Conservative lexical similarity for matching a returned fact-check
-    to the user's actual claim."""
     aa, bb = clean(a), clean(b)
-    if not aa or not bb:
-        return 0.0
+    if not aa or not bb: return 0.0
     seq = SequenceMatcher(None, aa, bb).ratio()
     wa, wb = words(aa), words(bb)
-    if not wa or not wb:
-        return seq
+    if not wa or not wb: return seq
     overlap = len(wa & wb) / max(1, min(len(wa), len(wb)))
     jaccard = len(wa & wb) / max(1, len(wa | wb))
     return 0.45 * seq + 0.35 * overlap + 0.20 * jaccard
 
 def extract_date(obj):
-    # The API can expose review metadata in different nested locations.
-    candidates = [
-        obj.get("reviewDate"),
-        obj.get("datePublished"),
-        obj.get("claimReview", {}).get("datePublished")
-            if isinstance(obj.get("claimReview"), dict) else None,
-    ]
+    candidates = [obj.get("reviewDate"), obj.get("datePublished"),
+                  obj.get("claimReview", {}).get("datePublished") if isinstance(obj.get("claimReview"), dict) else None]
     for value in candidates:
         if value:
             try:
-                text = str(value).replace("Z", "+00:00")
-                dt = datetime.fromisoformat(text)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt
-            except Exception:
-                pass
+                dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            except Exception: pass
     return None
 
 def time_sensitive_claim(text):
-    t = text.lower()
-    patterns = [
-        r"\bcurrent\b", r"\bcurrently\b", r"\btoday\b", r"\bnow\b",
-        r"\bthis week\b", r"\bthis month\b", r"\byesterday\b",
-        r"\btomorrow\b", r"\bthis year\b", r"\blatest\b",
-        r"\bpresent president\b",
-    ]
-    return any(re.search(p, t) for p in patterns)
+    return any(re.search(p, text.lower()) for p in [r"\bcurrent\b", r"\bcurrently\b", r"\btoday\b", r"\bnow\b", r"\bthis week\b", r"\bthis month\b", r"\byesterday\b", r"\btomorrow\b", r"\bthis year\b", r"\blatest\b", r"\bpresent president\b"])
 
 def year_tokens(text):
     return set(re.findall(r"\b(?:19|20)\d{2}\b", text))
 
 def candidate_relevance(user_claim, result):
-    claim_text = result.get("claim_text", "")
-    title = result.get("title", "")
-    combined = f"{claim_text} {title}".strip()
+    combined = f"{result.get('claim_text','')} {result.get('title','')}".strip()
     score = similarity(user_claim, combined)
-
-    # If the user's claim names a specific year, a result about a different
-    # year should not be treated as direct evidence.
-    qyears = year_tokens(user_claim)
-    ryears = year_tokens(combined)
-    if qyears and ryears and not (qyears & ryears):
-        return 0.0, "different year/context"
-
-    # Present-time claims require a reasonably recent fact-check. Otherwise an
-    # old fact-check can be incorrectly applied to a changed situation.
-    if time_sensitive_claim(user_claim):
-        dt = result.get("date")
-        if dt is not None:
-            age_days = (datetime.now(timezone.utc) - dt).days
-            if age_days > 365:
-                return score, "stale for a time-sensitive claim"
-
+    qyears, ryears = year_tokens(user_claim), year_tokens(combined)
+    if qyears and ryears and not (qyears & ryears): return 0.0, "different year/context"
+    if time_sensitive_claim(user_claim) and result.get("date") is not None:
+        if (datetime.now(timezone.utc) - result["date"]).days > 365: return score, "stale for a time-sensitive claim"
     return score, "matched"
 
 def build_factcheck_queries(query):
-    """Create several retrieval variants for the Google Fact Check API.
-
-    Google documents `query` as a textual search over fact-checked claims.
-    Different wording can therefore retrieve different records. The original
-    claim remains the only text used by the evidence-matching stage.
-    """
     original = re.sub(r"\s+", " ", str(query)).strip()
     cleaned = clean(original)
-
-    stopwords = {
-        "a", "an", "and", "are", "as", "at", "be", "been", "being", "but",
-        "by", "for", "from", "has", "have", "had", "he", "her", "his", "i",
-        "if", "in", "into", "is", "it", "its", "of", "on", "or", "that",
-        "the", "their", "there", "these", "they", "this", "to", "was", "were",
-        "will", "with", "would", "you", "your"
-    }
-    informative = [w for w in cleaned.split() if w not in stopwords]
-
+    stop = {"a","an","and","are","as","at","be","been","being","but","by","for","from","has","have","had","he","her","his","i","if","in","into","is","it","its","of","on","or","that","the","their","there","these","they","this","to","was","were","will","with","would","you","your"}
+    informative = [w for w in cleaned.split() if w not in stop]
     queries = [original]
-    if informative:
-        queries.append(" ".join(informative))
+    if informative: queries.append(" ".join(informative))
     if len(informative) >= 3:
-        # Entity/topic-first variants often work better for fact-check titles.
-        queries.append(" ".join([informative[0], informative[-1], *informative[1:-1]]))
-        queries.append(" ".join(informative[:2] + informative[-2:]))
-
-    # Remove duplicates while preserving order.
-    unique = []
-    seen = set()
+        queries += [" ".join([informative[0], informative[-1], *informative[1:-1]]), " ".join(informative[:2] + informative[-2:])]
+    out=[]; seen=set()
     for q in queries:
-        q = q.strip()
-        key = q.lower()
-        if q and key not in seen:
-            seen.add(key)
-            unique.append(q[:500])
-    return unique
-
+        k=q.lower().strip()
+        if k and k not in seen: seen.add(k); out.append(q[:500])
+    return out
 
 def nigeria_related(query):
-    t = clean(query)
-    return bool(re.search(r"\b(?:nigeria|nigerian|abuja|lagos|tinubu|naira)\b", t))
+    return bool(re.search(r"\b(?:nigeria|nigerian|abuja|lagos|tinubu|naira|jamb|nysc|kwara|rivers|abia)\b", clean(query)))
 
-
-def _make_item(query, claim_text, title, publisher, rating, url, date,
-                search_query="", publisher_filter=""):
-    item = {
-        "claim_text": claim_text or title or "",
-        "title": title or claim_text or "",
-        "publisher": publisher or "Unknown publisher",
-        "rating": rating or "Not stated",
-        "url": url,
-        "date": date,
-        "search_query": search_query,
-        "publisher_filter": publisher_filter,
-    }
-    score, reason = candidate_relevance(query, item)
-    item["score"] = score
-    item["reason"] = reason
+def _make_item(query, claim_text, title, publisher, rating, url, date, search_query="", publisher_filter=""):
+    item={"claim_text":claim_text or title or "", "title":title or claim_text or "", "publisher":publisher or "Unknown publisher", "rating":rating or "Not stated", "url":url, "date":date, "search_query":search_query, "publisher_filter":publisher_filter}
+    item["score"], item["reason"] = candidate_relevance(query,item)
     return item
 
+# ---------- Nigerian local evidence corpus ----------
+@st.cache_data
+def load_local_factchecks():
+    if not LOCAL_FACTCHECK_CSV.exists(): return []
+    rows=[]
+    try:
+        with LOCAL_FACTCHECK_CSV.open("r",encoding="utf-8",newline="") as f:
+            for r in csv.DictReader(f):
+                try: r["date"]=datetime.fromisoformat(r["date"]).replace(tzinfo=timezone.utc)
+                except Exception: r["date"]=None
+                rows.append(r)
+    except Exception: return []
+    return rows
 
-def _parse_google_claims(query, data, all_results, search_query, publisher_filter=""):
-    for claim in data.get("claims", []) or []:
-        claim_text = claim.get("text", "")
-        for review in claim.get("claimReview", []) or []:
-            publisher = review.get("publisher", {}) or {}
-            item = _make_item(
-                query=query,
-                claim_text=claim_text,
-                title=review.get("title") or claim_text,
-                publisher=publisher.get("name") or publisher.get("site"),
-                rating=review.get("textualRating"),
-                url=review.get("url"),
-                date=extract_date(review),
-                search_query=search_query,
-                publisher_filter=publisher_filter,
-            )
-            all_results.append(item)
+@st.cache_resource
+def build_local_factcheck_index():
+    rows=load_local_factchecks()
+    if not rows: return None, []
+    corpus=[f"{r['claim_text']} {r['title']}" for r in rows]
+    vec=TfidfVectorizer(analyzer="char_wb",ngram_range=(3,5),min_df=1,sublinear_tf=True,lowercase=True)
+    return vec,(vec.fit_transform(corpus),rows)
 
+def _local_factcheck_candidates(query):
+    if not nigeria_related(query): return []
+    vec,payload=build_local_factcheck_index()
+    if vec is None: return []
+    matrix,rows=payload
+    scores=cosine_similarity(vec.transform([query]),matrix)[0]
+    results=[]
+    for score,row in zip(scores,rows):
+        item=_make_item(query,row["claim_text"],row["title"],row["publisher"],row["rating"],row["url"],row["date"],"local Nigerian fact-check corpus",row["publisher"])
+        item["score"]=0.65*float(score)+0.35*item["score"]
+        item["reason"]="local Nigerian corpus match"
+        if item["score"]>=0.42: results.append(item)
+    return sorted(results,key=lambda x:x["score"],reverse=True)[:10]
 
-def _search_google_once(query, api_key, publisher_filter=None, offset=0):
-    """One documented Fact Check Tools API request."""
-    params = {
-        "query": query,
-        "languageCode": "en",
-        "pageSize": 50,
-        "offset": offset,
-        "key": api_key,
-    }
-    if publisher_filter:
-        params["reviewPublisherSiteFilter"] = publisher_filter
+def _parse_google_claims(query,data,all_results,search_query,publisher_filter=""):
+    for claim in data.get("claims",[]) or []:
+        for review in claim.get("claimReview",[]) or []:
+            pub=review.get("publisher",{}) or {}
+            all_results.append(_make_item(query,claim.get("text",""),review.get("title") or claim.get("text",""),pub.get("name") or pub.get("site"),review.get("textualRating"),review.get("url"),extract_date(review),search_query,publisher_filter))
 
-    response = requests.get(FACTCHECK_URL, params=params, timeout=15)
-    response.raise_for_status()
-    return response.json()
-
+def _search_google_once(query,api_key,publisher_filter=None,offset=0):
+    params={"query":query,"languageCode":"en","pageSize":50,"offset":offset,"key":api_key}
+    if publisher_filter: params["reviewPublisherSiteFilter"]=publisher_filter
+    r=requests.get(FACTCHECK_URL,params=params,timeout=15); r.raise_for_status(); return r.json()
 
 def _africacheck_candidates(query):
-    """Regional fallback for Nigerian claims.
-
-    Africa Check has a public search page. This fallback is deliberately
-    separate from the Google API result set and still passes every candidate
-    through the same claim/context matching stage.
-    """
-    if not nigeria_related(query):
-        return []
-
-    results = []
-    search_url = (
-        "https://africacheck.org/search?search_api_fulltext="
-        + quote_plus(query)
-    )
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1"
-        )
-    }
-
+    if not nigeria_related(query): return []
+    results=[]; search_url="https://africacheck.org/search?search_api_fulltext="+quote_plus(query)
+    headers={"User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1"}
     try:
-        response = requests.get(search_url, headers=headers, timeout=15)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        seen_urls = set()
-        for a in soup.find_all("a", href=True):
-            href = a.get("href", "")
-            if "/fact-checks/" not in href:
-                continue
-
-            if href.startswith("/"):
-                url = "https://africacheck.org" + href
-            elif href.startswith("http"):
-                url = href
-            else:
-                continue
-
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
-
-            title = " ".join(a.get_text(" ", strip=True).split())
-            if len(title) < 10:
-                continue
-
-            # The search result title itself is used as the candidate claim
-            # representation. Do not invent a rating from unrelated text.
-            item = _make_item(
-                query=query,
-                claim_text=title,
-                title=title,
-                publisher="Africa Check",
-                rating="Not stated",
-                url=url,
-                date=None,
-                search_query=query,
-                publisher_filter="africacheck.org",
-            )
-
-            # Only fetch an article after it has reasonable lexical relevance.
-            if item["score"] < 0.40:
-                continue
-
+        r=requests.get(search_url,headers=headers,timeout=15); r.raise_for_status(); soup=BeautifulSoup(r.text,"html.parser")
+        seen=set()
+        for a in soup.find_all("a",href=True):
+            href=a["href"]
+            if "/fact-checks/" not in href: continue
+            url="https://africacheck.org"+href if href.startswith("/") else href
+            if url in seen: continue
+            seen.add(url); title=" ".join(a.get_text(" ",strip=True).split())
+            if len(title)<10: continue
+            item=_make_item(query,title,title,"Africa Check","Not stated",url,None,query,"africacheck.org")
+            if item["score"]<0.40: continue
             try:
-                article = requests.get(url, headers=headers, timeout=12)
-                if article.ok:
-                    article_soup = BeautifulSoup(article.text, "html.parser")
-
-                    # Prefer ClaimReview JSON-LD when available.
-                    for script in article_soup.find_all(
-                        "script", attrs={"type": "application/ld+json"}
-                    ):
-                        raw = script.string or script.get_text()
-                        try:
-                            data = json.loads(raw)
-                        except Exception:
-                            continue
-
-                        objects = data if isinstance(data, list) else [data]
-                        stack = list(objects)
-                        while stack:
-                            obj = stack.pop()
-                            if isinstance(obj, dict):
-                                typ = obj.get("@type")
-                                if typ == "ClaimReview" or (
-                                    isinstance(typ, list) and "ClaimReview" in typ
-                                ):
-                                    claim_reviewed = obj.get("claimReviewed") or title
-                                    rating_obj = obj.get("reviewRating") or {}
-                                    rating = (
-                                        rating_obj.get("alternateName")
-                                        or rating_obj.get("textualRating")
-                                        or "Not stated"
-                                    )
-                                    date_value = obj.get("datePublished")
-                                    dt = None
-                                    if date_value:
-                                        try:
-                                            dt = datetime.fromisoformat(
-                                                str(date_value).replace("Z", "+00:00")
-                                            )
-                                            if dt.tzinfo is None:
-                                                dt = dt.replace(tzinfo=timezone.utc)
-                                        except Exception:
-                                            pass
-
-                                    item = _make_item(
-                                        query=query,
-                                        claim_text=claim_reviewed,
-                                        title=title,
-                                        publisher="Africa Check",
-                                        rating=rating,
-                                        url=obj.get("url") or url,
-                                        date=dt,
-                                        search_query=query,
-                                        publisher_filter="africacheck.org",
-                                    )
-                                    break
-
-                                for value in obj.values():
-                                    if isinstance(value, (dict, list)):
-                                        stack.append(value)
-                            elif isinstance(obj, list):
-                                stack.extend(obj)
-
-                    # If structured data did not provide a rating, use only
-                    # explicit wording on the article page.
-                    if item["rating"] == "Not stated":
-                        body_text = article_soup.get_text(" ", strip=True).lower()
-                        if re.search(r"\bthe claim is false\b", body_text):
-                            item["rating"] = "False"
-                        elif re.search(r"\bclaim is misleading\b", body_text):
-                            item["rating"] = "Misleading"
-
-            except requests.RequestException:
-                pass
-
+                ar=requests.get(url,headers=headers,timeout=12)
+                if ar.ok:
+                    soup2=BeautifulSoup(ar.text,"html.parser")
+                    for script in soup2.find_all("script",attrs={"type":"application/ld+json"}):
+                        try: data=json.loads(script.string or script.get_text())
+                        except Exception: continue
+                        stack=list(data if isinstance(data,list) else [data]); found=False
+                        while stack and not found:
+                            obj=stack.pop()
+                            if isinstance(obj,dict):
+                                typ=obj.get("@type")
+                                if typ=="ClaimReview" or (isinstance(typ,list) and "ClaimReview" in typ):
+                                    rr=obj.get("reviewRating") or {}
+                                    item=_make_item(query,obj.get("claimReviewed") or title,title,"Africa Check",rr.get("alternateName") or rr.get("textualRating") or "Not stated",obj.get("url") or url,extract_date(obj),query,"africacheck.org"); found=True; break
+                                stack.extend(v for v in obj.values() if isinstance(v,(dict,list)))
+                            elif isinstance(obj,list): stack.extend(obj)
+                    if item["rating"]=="Not stated":
+                        body=soup2.get_text(" ",strip=True).lower()
+                        if re.search(r"\bthe claim is false\b",body): item["rating"]="False"
+                        elif re.search(r"\bclaim is misleading\b",body): item["rating"]="Misleading"
+            except requests.RequestException: pass
             results.append(item)
+    except requests.RequestException: return []
+    return sorted(results,key=lambda x:x["score"],reverse=True)[:10]
 
-    except requests.RequestException:
-        return []
-
-    # Keep only the strongest candidates.
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:10]
-
-
-def _local_verified_candidates(query):
-    """Match against a small, explicitly verified local fact-check index.
-
-    This is a fallback for environments where live fact-check retrieval is
-    unavailable. Only records explicitly stored in the index can be returned.
-    """
-    results = []
-    for record in VERIFIED_FACTCHECK_INDEX:
-        item = _make_item(
-            query=query,
-            claim_text=record["claim_text"],
-            title=record["title"],
-            publisher=record["publisher"],
-            rating=record["rating"],
-            url=record["url"],
-            date=record["date"],
-            search_query="local verified index",
-            publisher_filter="",
-        )
-        if item["score"] >= 0.55:
-            results.append(item)
-    return results
-
-
-def search_fact_checks(query, api_key):
-    """Retrieve fact-check candidates using Google plus a Nigerian regional fallback.
-
-    Google Fact Check Tools supports textual query, publisher filtering, and
-    offset/page-token pagination. We use multiple focused queries to improve
-    recall, then apply the same conservative evidence matching before a verdict.
-    """
-    all_results = []
-
-    # Local verified fallback is checked first so the application remains
-    # demonstrable even when external retrieval is unavailable or blocked.
-    all_results.extend(_local_verified_candidates(query))
-
-    queries = build_factcheck_queries(query)
-
-    # Add a compact entity/topic query. This is especially useful when the
-    # original sentence differs from the wording used by the fact-checker.
-    informative = [
-        w for w in clean(query).split()
-        if w not in {
-            "a", "an", "and", "are", "as", "at", "be", "been", "being", "but",
-            "by", "for", "from", "has", "have", "had", "he", "her", "his", "i",
-            "if", "in", "into", "is", "it", "its", "of", "on", "or", "that",
-            "the", "their", "there", "these", "they", "this", "to", "was",
-            "were", "will", "with", "would", "you", "your"
-        }
-    ]
-    if len(informative) >= 3:
-        queries.append(" ".join(informative))
-
-    # Deduplicate queries.
-    unique_queries = []
-    seen_q = set()
+def search_fact_checks(query,api_key):
+    all_results=[]
+    # Local corpus is first: fast, deterministic and resilient to API/network failure.
+    all_results.extend(_local_factcheck_candidates(query))
+    queries=build_factcheck_queries(query)
+    informative=[w for w in clean(query).split() if w not in {"a","an","and","are","as","at","be","been","being","but","by","for","from","has","have","had","he","her","his","i","if","in","into","is","it","its","of","on","or","that","the","their","there","these","they","this","to","was","were","will","with","would","you","your"}]
+    if len(informative)>=3: queries.append(" ".join(informative))
+    uniq=[]; seen=set()
     for q in queries:
-        key = q.lower().strip()
-        if key and key not in seen_q:
-            seen_q.add(key)
-            unique_queries.append(q)
-
-    # Google API: first page plus one offset page for each focused query.
-    # The API explicitly documents offset as a supported parameter.
-    for search_query in unique_queries[:5]:
-        for offset in (0, 50):
+        k=q.lower().strip()
+        if k and k not in seen: seen.add(k); uniq.append(q)
+    for q in uniq[:5]:
+        for offset in (0,50):
             try:
-                data = _search_google_once(
-                    search_query, api_key, publisher_filter=None, offset=offset
-                )
-                _parse_google_claims(
-                    query, data, all_results, search_query, ""
-                )
-                if not data.get("claims"):
-                    break
-            except requests.RequestException:
-                # Preserve successful results from other query variants.
-                break
-
-    # Publisher-filtered searches are useful for Nigeria-specific claims.
+                data=_search_google_once(q,api_key,offset=offset); _parse_google_claims(query,data,all_results,q)
+                if not data.get("claims"): break
+            except requests.RequestException: break
     if nigeria_related(query):
-        for publisher in ("africacheck.org", "dubawa.org"):
-            for search_query in unique_queries[:3]:
-                try:
-                    data = _search_google_once(
-                        search_query,
-                        api_key,
-                        publisher_filter=publisher,
-                        offset=0,
-                    )
-                    _parse_google_claims(
-                        query, data, all_results, search_query, publisher
-                    )
-                except requests.RequestException:
-                    break
-
-    # Direct Africa Check search fallback. This is still treated as external
-    # published evidence, not as an NLP prediction.
-    all_results.extend(_africacheck_candidates(query))
-
-    # Deduplicate records returned through different retrieval paths.
-    deduped = {}
+        for publisher in ("africacheck.org","dubawa.org"):
+            for q in uniq[:3]:
+                try: _parse_google_claims(query,_search_google_once(q,api_key,publisher_filter=publisher),all_results,q,publisher)
+                except requests.RequestException: break
+        all_results.extend(_africacheck_candidates(query))
+    dedup={}
     for item in all_results:
-        key = item.get("url") or (
-            item.get("publisher", ""),
-            item.get("claim_text", ""),
-            item.get("rating", "")
-        )
-        if key not in deduped or item["score"] > deduped[key]["score"]:
-            deduped[key] = item
+        key=item.get("url") or (item.get("publisher",""),item.get("claim_text",""),item.get("rating",""))
+        if key not in dedup or item["score"]>dedup[key]["score"]: dedup[key]=item
+    return sorted(dedup.values(),key=lambda x:x["score"],reverse=True)
 
-    results = list(deduped.values())
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return results
-
-
-def select_evidence(query, results):
-    if not results:
-        return None
-
-    # Conservative threshold: a related fact-check is not enough.
-    best = results[0]
-    if best["score"] < 0.62:
-        return None
-
-    if best["reason"] == "stale for a time-sensitive claim":
-        return None
-
-    # For short claims, require stronger lexical agreement.
-    q_words = words(query)
-    if len(q_words) <= 7 and best["score"] < 0.72:
-        return None
-
+def select_evidence(query,results):
+    if not results: return None
+    best=results[0]
+    # Local corpus has a slightly more tolerant threshold because its records
+    # are explicitly curated published evidence; API results keep the old bar.
+    threshold=0.50 if best["reason"]=="local Nigerian corpus match" else 0.62
+    if best["score"]<threshold or best["reason"]=="stale for a time-sensitive claim": return None
+    if len(words(query))<=7 and best["score"]<(0.62 if best["reason"]=="local Nigerian corpus match" else 0.72): return None
     return best
 
-# ---------------- UI ----------------
-
 try:
-    article_bundle, headline_bundle = load_models()
+    article_bundle,headline_bundle=load_models()
 except Exception as exc:
-    st.error("The machine-learning model could not be loaded.")
-    st.exception(exc)
-    st.stop()
+    st.error("The machine-learning model could not be loaded."); st.exception(exc); st.stop()
 
 st.title("Fake News Detection System")
-st.write(
-    "Natural Language Processing prototype for classifying news text and "
-    "checking it against published fact-check evidence."
-)
+st.write("Natural Language Processing prototype for classifying news text and checking it against published fact-check evidence.")
+st.info("The NLP model estimates linguistic classification risk. The verification result is based on matching published fact-check evidence; a missing fact-check does not mean a claim is true.")
+mode=st.radio("Input type",["Headline / claim","Full article"],horizontal=True)
+text=st.text_area("Enter a claim or news text",height=220,placeholder="Example: The government has announced a new national holiday.")
 
-st.info(
-    "The NLP model estimates linguistic classification risk. "
-    "The verification result is based on matching published fact-check evidence; "
-    "a missing fact-check does not mean a claim is true."
-)
-
-mode = st.radio(
-    "Input type",
-    ["Headline / claim", "Full article"],
-    horizontal=True,
-)
-
-text = st.text_area(
-    "Enter a claim or news text",
-    height=220,
-    placeholder="Example: The government has announced a new national holiday.",
-)
-
-if st.button("Analyse & Verify", type="primary"):
-    if not text.strip():
-        st.warning("Please enter text to analyse.")
-        st.stop()
-
-    min_words = 3 if mode == "Headline / claim" else 20
-    if len(text.split()) < min_words:
-        st.warning(
-            f"Please enter at least {min_words} words for {mode.lower()} analysis."
-        )
-        st.stop()
-
-    # NLP layer
-    bundle = headline_bundle if mode == "Headline / claim" else article_bundle
-    nlp_label, nlp_confidence, _ = model_prediction(bundle, text)
-
-    # Fact-check layer
-    api_key = st.secrets.get("GOOGLE_FACTCHECK_API_KEY", "").strip()
-
-    evidence = None
-    raw_results = []
-    api_error = None
-
+if st.button("Analyse & Verify",type="primary"):
+    if not text.strip(): st.warning("Please enter text to analyse."); st.stop()
+    min_words=3 if mode=="Headline / claim" else 20
+    if len(text.split())<min_words: st.warning(f"Please enter at least {min_words} words for {mode.lower()} analysis."); st.stop()
+    bundle=headline_bundle if mode=="Headline / claim" else article_bundle
+    nlp_label,nlp_confidence,_=model_prediction(bundle,text)
+    api_key=st.secrets.get("GOOGLE_FACTCHECK_API_KEY","").strip()
+    evidence=None; raw_results=[]; api_error=None
     if api_key:
         try:
-            raw_results = search_fact_checks(text, api_key)
-            evidence = select_evidence(text, raw_results)
-        except requests.HTTPError as exc:
-            api_error = f"Fact-check API returned HTTP {exc.response.status_code}."
-        except requests.RequestException:
-            api_error = "The fact-check service could not be reached."
-        except Exception as exc:
-            api_error = f"Fact-check lookup failed: {exc}"
-
+            raw_results=search_fact_checks(text,api_key); evidence=select_evidence(text,raw_results)
+        except requests.HTTPError as exc: api_error=f"Fact-check API returned HTTP {exc.response.status_code}."
+        except requests.RequestException: api_error="The fact-check service could not be reached."
+        except Exception as exc: api_error=f"Fact-check lookup failed: {exc}"
     st.subheader("Verification result")
-
     if evidence:
-        rating = evidence["rating"]
-        rating_lower = rating.lower()
-
-        if any(x in rating_lower for x in ["false", "fake", "incorrect", "misleading"]):
-            st.error("VERDICT: Potentially Fake / Misleading")
-        elif any(x in rating_lower for x in ["true", "correct", "accurate"]):
-            st.success("VERDICT: Supported by Published Fact-check Evidence")
-        else:
-            st.warning("VERDICT: Published Fact-check Found — Review Rating")
-
+        rating=evidence["rating"]; rl=rating.lower()
+        if any(x in rl for x in ["false","fake","incorrect","misleading"]): st.error("VERDICT: Potentially Fake / Misleading")
+        elif any(x in rl for x in ["true","correct","accurate"]): st.success("VERDICT: Supported by Published Fact-check Evidence")
+        else: st.warning("VERDICT: Published Fact-check Found — Review Rating")
         st.write(f"**Fact-check publisher:** {evidence['publisher']}")
         st.write(f"**Published rating:** {rating}")
         st.write(f"**Matched claim:** {evidence['claim_text']}")
-
-        if evidence["date"]:
-            st.write(
-                f"**Fact-check date:** {evidence['date'].date().isoformat()}"
-            )
-
-        if evidence["url"]:
-            st.link_button("Open fact-check", evidence["url"])
-
-        if evidence.get("search_query") == "local verified index":
-            st.info(
-                "This record was matched from the system's verified local "
-                "fact-check index because live retrieval did not return the "
-                "publisher record. The source remains the named fact-check publisher."
-            )
-
-        st.caption(
-            "The verdict above is attributed to the fact-check publisher. "
-            "It is not generated by the NLP classifier. The system first checks "
-            "whether the returned fact-check is sufficiently similar and "
-            "contextually relevant to the submitted claim."
-        )
-
+        if evidence["date"]: st.write(f"**Fact-check date:** {evidence['date'].date().isoformat()}")
+        if evidence["url"]: st.link_button("Open fact-check",evidence["url"])
+        if evidence.get("search_query")=="local Nigerian fact-check corpus": st.info("This record was matched from the system's local Nigerian fact-check evidence corpus. The source remains the named fact-check publisher.")
+        st.caption("The verdict above is attributed to the fact-check publisher. It is not generated by the NLP classifier. The system first checks whether the returned fact-check is sufficiently similar and contextually relevant to the submitted claim.")
     else:
         st.warning("VERDICT: UNVERIFIED")
-        if api_error:
-            st.write(api_error)
-        elif not api_key:
-            st.write(
-                "No Google Fact Check API key is configured. The system cannot "
-                "issue an evidence-based fact-check verdict."
-            )
-        elif raw_results:
-            st.write(
-                "Related fact-check records were found, but none passed the "
-                "system's claim-similarity/context checks. They were not used "
-                "to issue a false/true verdict."
-            )
-        else:
-            st.write(
-                "No matching published fact-check was found. This does not mean "
-                "the claim is true; it means the system does not have sufficient "
-                "verified evidence to issue a fake/real verdict."
-            )
-
+        if api_error: st.write(api_error)
+        elif not api_key: st.write("No Google Fact Check API key is configured. The system cannot issue an evidence-based fact-check verdict.")
+        elif raw_results: st.write("Related fact-check records were found, but none passed the system's claim-similarity/context checks. They were not used to issue a false/true verdict.")
+        else: st.write("No matching published fact-check was found. This does not mean the claim is true; it means the system does not have sufficient verified evidence to issue a fake/real verdict.")
     st.subheader("NLP model assessment")
-    if nlp_label == "Potentially Fake / Misleading":
-        st.error(f"{nlp_label} — model confidence: {nlp_confidence:.1%}")
-    else:
-        st.success(f"{nlp_label} — model confidence: {nlp_confidence:.1%}")
-
-    st.caption(
-        "The NLP assessment is a statistical text-classification output trained "
-        "on the project's labelled dataset. It is not independent fact-checking."
-    )
-
+    if nlp_label=="Potentially Fake / Misleading": st.error(f"{nlp_label} — model confidence: {nlp_confidence:.1%}")
+    else: st.success(f"{nlp_label} — model confidence: {nlp_confidence:.1%}")
+    st.caption("The NLP assessment is a statistical text-classification output trained on the project's labelled dataset. It is not independent fact-checking.")
     if raw_results and evidence is None:
         with st.expander("Why a related fact-check was not used"):
             for r in raw_results[:5]:
-                date_text = r["date"].date().isoformat() if r["date"] else "date unavailable"
-                st.write(
-                    f"**{r['publisher']}** — {r['rating']} — similarity "
-                    f"{r['score']:.2f} — {r['reason']} — {date_text}"
-                )
+                d=r["date"].date().isoformat() if r["date"] else "date unavailable"
+                st.write(f"**{r['publisher']}** — {r['rating']} — similarity {r['score']:.2f} — {r['reason']} — {d}")
                 st.write(r["claim_text"])
 
 with st.expander("About the system"):
-    st.write(
-        "The system combines an NLP classification layer with a conservative "
-        "published-fact-check retrieval layer. It does not treat the absence "
-        "of a fact-check as proof that a claim is true."
-    )
+    st.write("The system combines an NLP classification layer with a conservative published-fact-check retrieval layer. It does not treat the absence of a fact-check as proof that a claim is true.")
